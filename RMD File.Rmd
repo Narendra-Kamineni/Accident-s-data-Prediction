@@ -1,0 +1,229 @@
+---
+title: "US Elections"
+text: "Project- Categorical part (GLM model)"
+author: "Bhanu Angam and Viktor Moortgat"
+date: "13/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+
+The dataset we propose includes county level data on the US elections 2016. we have to pick the one variable out of all the available potential predictors and build a simple linear model first and then a multiple linear regression analysis by adjusting the variables from our selected list of six. 
+
+```{r Loading data}
+county_facts_dictionary <- read.csv("county_facts_dictionary.csv")
+us_poll <- read.csv("US_County_Level_Presidential_Results_12-16_.csv")
+us_poll <- na.omit(us_poll)
+head(us_poll)[,1:10]
+```
+
+## Other variables
+
+For the other variables (make sure the variables you pick are of the same year)
+
+  * Pick a variable related to age just one, if you pick two age-related variables they will be correlated
+  * Pick something in relation to population, e.g., Population, 2014 estimate
+  * A variable related education only one variable, check the distribution
+  * A variable related to language maybe? this might be correlated with education, check them
+  * A variable that relates to income, this might be correlated with age and language and education, check them
+  * Other variables, please pick a variable that is actionable, you can’t really change people’s ages or education during campaign, well maybe look for a variable that the politicians can really impact in the course of their campaign.
+
+
+
+## Selection of Predictors and preparing data
+
+```{r include=FALSE}
+library(tidyverse)
+library(Hmisc)
+library(psych)
+library(usmap)
+library(pROC)
+library(ROCR)
+library(pscl)
+library(caret)
+library(ggplot2)
+library(ggthemes)
+```
+
+```{r}
+my_data <- us_poll[, c("per_dem_2016", "votes_dem_2012", 'RHI125214', "AGE295214", "EDU685213", "PVY020213", "POP815213", "HSG445213", "SBO315207", "state_abbr")]
+
+my_data <- my_data %>%
+  rename(
+    "White_alone" = "RHI125214",
+    "under_18_years" = "AGE295214",
+    "Bachelor_degree" = "EDU685213",
+    "below_poverty" = "PVY020213",
+    "Language other than English" = "POP815213",
+    "Homeownership_rate"= "HSG445213",
+    "Black-owned firms" = "SBO315207",
+  )
+
+my_data$state_abbr <- as.factor(my_data$state_abbr)
+my_data$intwhitlang = my_data$White_alone * my_data$`Language other than English`
+my_data$intwhitage = my_data$White_alone * my_data$under_18_years
+my_data$intvoteswhit = my_data$votes_dem_2012 * my_data$White_alone
+my_data$intwhitbach = my_data$White_alone * my_data$Bachelor_degree
+my_data$intvotesbach = my_data$votes_dem_2012 * my_data$Bachelor_degree
+my_data <- na.omit(my_data)
+head(my_data)
+
+```
+
+While developing model, iteratively analyse variables for
+
+  * Normality of Distribution
+  * Extreme Values
+  * Multiple Collinearity
+  * Homoscedasticity (even distribution of residuals)
+  * P-values of coefficients and R2/F-Statistic of the model
+  
+## Generalized linear model
+
+*  Dichotomize or categorize your continuous response variable in a way that will help one focus in the next election campaign. Start from the final model for the continuous outcome to build one adapted to your categorical outcome, using a generalized linear model. Adapt the model if it appears necessary.
+
+### Scope of Study
+
+  * We can categorize the response variable(per_votes_16) into 3 categories. That is if the predicted outcome is close to 'Undecided'(around 50%) plus minus 2% of the votes. if this is the case: the county deserves more focus and action in the campaign leading up to the (next) elections.
+  * First recompute the percentages so that 50% will really mean undecided or within 2% will mean between [48%,52%].
+  * If the party didnt get enough lead even after choosing the undecided or close to 48%, then increase the boundary i.e within 10% till the party gets enough lead.
+  * Then focus on the states that are close to undecided which will give significant results during next election to turn the undecided states
+
+```{r}
+us_poll['new_per_dem_2016'] = cut(my_data$per_dem_2016,c(0,.48,.52,1))
+# theme_map(base_size = 9, base_family = "")
+plot_usmap(values = 'new_per_dem_2016', data=us_poll, "states", exclude = "states", theme=theme_map(base_size = 12, base_family = "")) + labs(title = "Effect of undecided states on Democratic party")
+
+```
+
+  * The undecided states are green in color which are not many to focus a campaign for a win so lets increase the undecided percent to 10% [41%,51%].
+
+```{r}
+us_poll['per_dem_2016'] = cut(my_data$per_dem_2016,c(0,.42,.52,1))
+plot_usmap(values = 'new_per_dem_2016', data=us_poll)
+```
+
+  * In this setting we find many undecided states. The democratic party focus the campaign on these states to win the elections if not we can increse the undecided percent until they get enough green(undecided) states to gain lead over GOP.
+  
+### Categorizing continuous response variable and Splitting data
+
+  * Dichotomizing continuous Respose variable into two categories that is the states which have close to undecided percentage of votes and states with other than close to undecided percentage of votes
+  
+  $$ [48- 52]\ \% = "1" \\  [0 - 48)\ \%\ \ and \  \ (52 - 100]\%\ = "0"$$
+  
+```{r}
+my_data['per_dem_2016'] = cut(my_data$per_dem_2016,c(0,.40,.60,1), labels = c(1, 2, 3))
+my_data$per_dem_2016 = ifelse(test= my_data$per_dem_2016 == 2 , yes="1", no = "0" )
+my_data$per_dem_2016 = as.factor(my_data$per_dem_2016)
+
+```
+  
+  
+  * Splitting Data into Test and Train data for traing and validating the model.
+  
+```{r}
+set.seed(1234)
+smp_size <- floor(0.8*nrow(my_data))
+
+train_ind <- sample(seq_len(nrow(my_data)), size = smp_size)
+train_data <- my_data[train_ind, ]
+test_data <- my_data[-train_ind, ]
+test_Y <- test_data["per_dem_2016"]
+table(test_Y)
+```
+
+  * Randomly selecting 80% of data as training data. In oreder to overcome the bias in response variable in future
+  
+### Model Building
+
+  * Selecting the same model from the continuous outcome from the previous linear regression analysis for Logistic regression.
+
+```{r}
+Model1 <- glm(per_dem_2016 ~ votes_dem_2012 + White_alone + under_18_years + Bachelor_degree, data= train_data, family = "binomial")
+Model2 <- glm(per_dem_2016 ~ votes_dem_2012 + White_alone + under_18_years + Bachelor_degree + `Language other than English` +
+                  below_poverty, data= train_data, family = "binomial")
+Model3 <- glm(per_dem_2016 ~ votes_dem_2012 + White_alone + under_18_years + Bachelor_degree + `Language other than English` +
+                  below_poverty + intwhitlang + intwhitage + intvoteswhit + intwhitbach , data= train_data, family = "binomial")
+
+# summary(model1)
+```
+
+### Interpretation of Models
+
+```{r}
+anova(Model1, Model2, Model3, test ="Chisq")
+```
+
+  * Selecting model 3 and Tuning it for better performance by dropping out insignificant variables. Which will also lower AIC
+```{r}
+summary(Model3)
+# Dropping out Interaction between white, age_18 and below_poverty
+# Model <- glm(per_dem_2016 ~ votes_dem_2012  + Bachelor_degree + intvotesbach, data= train_data, family = "binomial")
+Model <- glm(per_dem_2016 ~ votes_dem_2012 + White_alone + under_18_years + Bachelor_degree + intwhitlang  + intvoteswhit + intwhitbach , data= train_data, family = "binomial")
+summary(Model)
+
+
+```
+  
+  * The model above has all the predictors with significant coefficient terms. Let's check the performance of the selected model now
+  
+### Prediction on Test Data and evaluating performance
+  
+  * The selected model above is used to predict the undecided states by using test_data and evaluate it's performance on various aspects step by step
+  * First the probabilities of predicted data is obtained using test data 
+
+```{r}
+ll_null <- Model$null.deviance / -2
+ll_prop <- Model$deviance / -2
+r2 <- (ll_null-ll_prop)/ll_null
+r2
+
+prob <- predict(Model, newdata= test_data, type = "response")
+test_data$predict <- ifelse(prob > 0.50, "1", "0")
+confusion_mat <- table(test_data$per_dem_2016, test_data$predict)
+rownames(confusion_mat) <- c("obs.0", "obs.1")
+colnames(confusion_mat) <- c("pred.0", "pred.1")
+confusion_mat
+accur <- sum(diag(confusion_mat))/sum(confusion_mat)
+accur
+```
+  * The Accuracy of the model is measured from the confusion matrix is found to be 83%, Since the Train data has less number of undecided states the catagorical variable is slightly biased and hence the tested model is not accurate with FALSE NEGATIVE prediction.
+  * If the undecided states margin is increased the train data gets enough balanced data and hence the model performance can be increased.
+  * The model is later evaluated by ROC/AUC curve by measuring TPR and FPR.
+
+```{r}
+pred <- prediction(prob, test_Y)
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+plot(perf)
+auc <- performance(pred, measure = "auc")
+auc <- auc@y.values[[1]]
+paste("AUC:", auc)
+```
+  * This shows that the model has descent True positive rate.
+
+### Variable Importance
+  
+  * The relative importance of individual predictors in the model can be found out by varimp() from caret package. 
+
+```{r}
+varImp(Model)
+```
+  * The importance levels of various predictors 
+  
+## Conclusion
+
+  * This model helps us to predicts the probability of whether the particular state falls under the Undecided category for coming elections.
+  * Using these insights the Democratic party can effectively focus on the particular states by canvasing more in these areas. 
+  * This model is also very useful to plan a campaign in such states and focus on particular set of people.
+  * The most effective stratagies can be designed with the help of this model.
+  
+## Additional Insights
+
+  * The above model can be improved much by training data with unbiased response variable (i.e balanced with both levels)
+  * Adding additional interaction terms may improve the model a little but the model becomes more complex to interpret finally.
+
+
